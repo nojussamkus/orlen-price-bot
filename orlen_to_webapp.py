@@ -19,8 +19,8 @@ TERMINAL_LINE = 'Akcinės bendrovės "Orlen Lietuva" terminalas Juodeikių km, M
 DATE_RE = re.compile(r"Kainos galioja nuo\s+(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})")
 
 # FILTRAI
-EXCLUDE_KEYWORDS = ("realizacij", "internet")   # atmesti visus „realizacija internet“ PDF
-PREFER_KEYWORDS  = ("protokol", "protokolas")   # prioritetas protokolams
+EXCLUDE_KEYWORDS = ("realizacij", "internet")   # atmesti „realizacija internet“ PDF
+PREFER_KEYWORDS  = ("protokol", "protokolas", "protokolai", "kainų protokol")  # pirmenybė protokolams
 
 SESSION = requests.Session()
 SESSION.headers.update({
@@ -47,7 +47,7 @@ def extract_links_with_text(html: str, base_url: str):
     return out
 
 def parse_date_from_string(s: str):
-    """Iš URL arba teksto ištraukia datą, jei yra: YYYY-MM-DD | YYYY_MM_DD | YYYYMMDD."""
+    """Iš URL arba teksto ištraukia datą (YYYY-MM-DD | YYYY_MM_DD | YYYYMMDD)."""
     for pat in (r"(\d{4})[-_](\d{2})[-_](\d{2})", r"(\d{4})(\d{2})(\d{2})"):
         m = re.search(pat, s)
         if m:
@@ -60,32 +60,13 @@ def parse_date_from_string(s: str):
 def is_pdf_like(url: str, text: str):
     u = url.lower()
     t = text.lower()
-    # atmesti nepageidaujamus
     if any(k in u or k in t for k in EXCLUDE_KEYWORDS):
         return False
-    # bent kažkoks PDF indikatorius (arba tekste, arba URL)
+    # bent kažkoks PDF/Protokolo indikatorius
     return u.endswith(".pdf") or "pdf" in u or "pdf" in t or any(k in u or k in t for k in PREFER_KEYWORDS)
 
-def head_or_get(url: str):
-    """Grąžina (ok_bool, content_type_str)."""
-    try:
-        h = SESSION.head(url, timeout=15, allow_redirects=True)
-        ct = h.headers.get("Content-Type", "")
-        if 200 <= h.status_code < 400 and ct:
-            return True, ct
-    except Exception:
-        pass
-    try:
-        g = SESSION.get(url, timeout=20, stream=True)
-        ct = g.headers.get("Content-Type", "")
-        ok = 200 <= g.status_code < 400
-        g.close()
-        return ok, ct
-    except Exception:
-        return False, ""
-
 def collect_candidate_pdfs():
-    """Surenkam visas PDF nuorodas su tekstais, atmetame „realizacija internet“, teikiam pirmenybę „protokol*“."""
+    """Surenka kandidatų sąrašą ir surikiuoja: (protokol prioritetas, data desc)."""
     pairs = []
     for page in LIST_URLS:
         html = http_get(page).text
@@ -95,19 +76,11 @@ def collect_candidate_pdfs():
     seen = set()
     pairs = [(u, t) for (u, t) in pairs if (u, t) not in seen and not seen.add((u, t))]
 
-    # filtruojam
+    # filtravimas
     filtered = [(u, t) for (u, t) in pairs if is_pdf_like(u, t)]
+    if not filtered:
+        raise RuntimeError("Neradau PDF kandidatų (po filtravimo).")
 
-    # patikrinam kad tikrai PDF
-    validated = []
-    for u, t in filtered:
-        ok, ct = head_or_get(u)
-        if ok and "pdf" in ct.lower():
-            validated.append((u, t))
-    if not validated:
-        raise RuntimeError("Neradau PDF kandidatų su PDF turiniu (po filtravimo).")
-
-    # scoring: 1) ar 'protokol*' nuorodos tekste/URL, 2) data (desc)
     def score(item):
         u, t = item
         txt = (u + " " + t).lower()
@@ -115,18 +88,32 @@ def collect_candidate_pdfs():
         d = parse_date_from_string(u) or parse_date_from_string(t) or datetime.min
         return (prefer, d)
 
-    validated.sort(key=score, reverse=True)
-    return [u for (u, _) in validated]
+    filtered.sort(key=score, reverse=True)
+    return filtered  # grąžinam (url, text)
 
 # ========= PDF PARSINIMAS =========
-def extract_pdf_text(pdf_bytes: bytes):
-    chunks = []
-    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        for p in pdf.pages:
-            text = p.extract_text() or ""
-            if text:
-                chunks.append(text)
-    return "\n".join(chunks)
+def extract_pdf_text_from_bytes(pdf_bytes: bytes):
+    """Grąžina ištisinį tekstą arba pakelia klaidą, jei PDF neskaitytinas."""
+    # pirmas patikrinimas – PDF „magija“
+    if len(pdf_bytes) < 10:
+        raise RuntimeError("Atsisiųstas failas per mažas.")
+    try:
+        # ne visi PDF prasideda %PDF pirmuose 4 baituose dėl BOM/WS, bet tikrinam euristiškai
+        if not pdf_bytes[:4] == b"%PDF":
+            # vis tiek bandome atidaryti su pdfplumber
+            pass
+        chunks = []
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for p in pdf.pages:
+                t = p.extract_text() or ""
+                if t:
+                    chunks.append(t)
+        txt = "\n".join(chunks).strip()
+        if not txt:
+            raise RuntimeError("PDF teksto nerasta (tuščias).")
+        return txt
+    except Exception as e:
+        raise RuntimeError(f"PDF skaitymo klaida: {e}")
 
 def clean_number(s: str) -> float:
     s = s.replace("\xa0", " ").replace(" ", "")
@@ -134,6 +121,7 @@ def clean_number(s: str) -> float:
     return float(s)
 
 def pick_value_for_terminal(pdf_text: str):
+    """Grąžina (date_str 'YYYY-MM-DD HH:MM' arba None, price float)."""
     mdate = DATE_RE.search(pdf_text)
     effective = f"{mdate.group(1)} {mdate.group(2)}" if mdate else None
 
@@ -169,20 +157,21 @@ def post_to_webapp(date_str: str, price: float):
 def main():
     try:
         candidates = collect_candidate_pdfs()
-        print(f"[INFO] Kandidatų (PDF) po filtravimo: {len(candidates)}")
+        print(f"[INFO] Kandidatų (po filtravimo/rikiavimo): {len(candidates)}")
         last_err = None
 
-        for i, pdf_url in enumerate(candidates, 1):
+        for i, (url, text) in enumerate(candidates, 1):
             try:
-                print(f"[INFO] ({i}/{len(candidates)}) Bandau: {pdf_url}")
-                pdf_bytes = http_get(pdf_url).content
-                text = extract_pdf_text(pdf_bytes)
-                date_str, price = pick_value_for_terminal(text)
+                print(f"[INFO] ({i}/{len(candidates)}) Bandau: {url}   [{text}]")
+                resp = http_get(url)
+                pdf_bytes = resp.content
+                pdf_text = extract_pdf_text_from_bytes(pdf_bytes)
+                date_str, price = pick_value_for_terminal(pdf_text)
                 if not date_str:
                     date_str = "1970-01-01 00:00"
                 print(f"[INFO] TINKA: date={date_str}, price={price}")
-                resp = post_to_webapp(date_str, price)
-                print("[INFO] WebApp atsakymas:", resp)
+                web_resp = post_to_webapp(date_str, price)
+                print("[INFO] WebApp atsakymas:", web_resp)
                 return
             except Exception as e:
                 last_err = e
