@@ -1,0 +1,18 @@
+name: ORLEN daily price to Google Sheets
+
+on:
+  schedule:
+    - cron: "10 6 * * *"  # 06:10 UTC = 09:10 Europe/Vilnius
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Run Orlen script
+        run: python orlen_to_webapp.py
