@@ -29,21 +29,24 @@ def http_get(url, **kw):
     r.raise_for_status()
     return r
 
-# ========= PDF nuorodų surinkimas ir rikiavimas =========
-def get_all_pdf_links(html: str, base_url: str):
-    links = re.findall(r'href=["\']([^"\']+\.pdf)["\']', html, flags=re.I)
-    links += re.findall(r'(https?://[^\s"\']+\.pdf)', html, flags=re.I)
-    abs_links, seen = [], set()
-    for l in links:
-        u = urljoin(base_url, l)
-        if u not in seen:
-            seen.add(u)
-            abs_links.append(u)
-    return abs_links
+# ========= NAUDINGOS PAGALBINĖS =========
+A_TAG_RE = re.compile(r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', re.I | re.S)
 
-def parse_date_from_url(url: str):
+def extract_links_with_text(html: str, base_url: str):
+    """Grąžina [(abs_url, visible_text)] iš visų <a>…</a>."""
+    out = []
+    for href, text in A_TAG_RE.findall(html):
+        url = urljoin(base_url, href.strip())
+        # sutvarkom tekstą
+        vis = re.sub(r"<[^>]+>", " ", text)
+        vis = re.sub(r"\s+", " ", vis).strip()
+        out.append((url, vis))
+    return out
+
+def parse_date_from_string(s: str):
+    """Bando išsitraukti datą iš URL arba teksto: YYYY-MM-DD | YYYY_MM_DD | YYYYMMDD."""
     for pat in (r"(\d{4})[-_](\d{2})[-_](\d{2})", r"(\d{4})(\d{2})(\d{2})"):
-        m = re.search(pat, url)
+        m = re.search(pat, s)
         if m:
             try:
                 return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
@@ -51,54 +54,75 @@ def parse_date_from_url(url: str):
                 pass
     return None
 
+def is_pdf_url(url: str):
+    """Greita euristika – bet tikriname ir atsakymo Content-Type vėliau."""
+    return url.lower().endswith(".pdf") or "pdf" in url.lower()
+
+def head_or_get(url: str):
+    """Grąžina (ok_bool, content_type_str)."""
+    try:
+        h = SESSION.head(url, timeout=15, allow_redirects=True)
+        ct = h.headers.get("Content-Type", "")
+        if 200 <= h.status_code < 400 and ct:
+            return True, ct
+    except Exception:
+        pass
+    try:
+        g = SESSION.get(url, timeout=20, stream=True)
+        ct = g.headers.get("Content-Type", "")
+        ok = 200 <= g.status_code < 400
+        g.close()
+        return ok, ct
+    except Exception:
+        return False, ""
+
 def collect_candidate_pdfs():
-    """Grąžina kandidatų sąrašą, surikiuotą nuo naujausio pagal datą URL’e (jei yra)."""
-    all_links = []
-    for url in LIST_URLS:
-        html = http_get(url).text
-        all_links.extend(get_all_pdf_links(html, url))
-    if not all_links:
-        raise RuntimeError("Neradau PDF nuorodų.")
+    """Surenkam VISAS kandidatų nuorodas su tekstais, dedam prioritetą 'protokol*', tikrinam Content-Type."""
+    pairs = []
+    for page in LIST_URLS:
+        html = http_get(page).text
+        pairs += extract_links_with_text(html, page)
 
-    # rikiuojam: su data (desc) -> be datos (originalia tvarka)
-    dated, nodate = [], []
-    for u in all_links:
-        d = parse_date_from_url(u)
-        if d: dated.append((d, u))
-        else: nodate.append(u)
-    dated.sort(key=lambda x: x[0], reverse=True)
-    ordered = [u for _, u in dated] + nodate
+    # pašalinam dublikatus išlaikant eiliškumą
+    seen = set()
+    uniq_pairs = []
+    for u, t in pairs:
+        if (u, t) not in seen:
+            seen.add((u, t))
+            uniq_pairs.append((u, t))
 
-    # pašalinam negyvus (jei tokių yra) – ir paliekam tvarką
-    alive = []
-    for u in ordered:
-        ok = False
-        try:
-            h = SESSION.head(u, timeout=15, allow_redirects=True)
-            ok = 200 <= h.status_code < 400
-        except Exception:
-            pass
-        if not ok:
-            try:
-                g = SESSION.get(u, timeout=15, stream=True)
-                ok = 200 <= g.status_code < 400
-                g.close()
-            except Exception:
-                ok = False
-        if ok and u not in alive:
-            alive.append(u)
-    if not alive:
-        raise RuntimeError("Rastos PDF nuorodos nepasiekiamos (HTTP).")
-    return alive
+    # filtruojame tik tas, kurios atrodo kaip PDF arba galėtų grąžinti PDF
+    maybe_pdf = [(u, t) for (u, t) in uniq_pairs if is_pdf_url(u) or "protokol" in t.lower() or "pdf" in t.lower()]
 
-# ========= PDF skaitymas ir parinkimas =========
+    # patikriname HEAD/GET ir pasiliekame tik tas, kurių Content-Type rodo pdf
+    validated = []
+    for u, t in maybe_pdf:
+        ok, ct = head_or_get(u)
+        if ok and "pdf" in ct.lower():
+            validated.append((u, t))
+
+    if not validated:
+        raise RuntimeError("Neradau PDF kandidatų su PDF turiniu.")
+
+    # scoring: 1) ar tekste yra 'protokol'/'protokolas', 2) data (desc)
+    def score(item):
+        u, t = item
+        prot = 1 if ("protokol" in t.lower()) else 0
+        d = parse_date_from_string(u) or parse_date_from_string(t) or datetime.min
+        # didesnis geriau: (prot, data)
+        return (prot, d)
+
+    validated.sort(key=score, reverse=True)
+    return [u for (u, _) in validated]
+
+# ========= PDF PARSINIMAS =========
 def extract_pdf_text(pdf_bytes: bytes):
     chunks = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for p in pdf.pages:
-            t = p.extract_text() or ""
-            if t:
-                chunks.append(t)
+            text = p.extract_text() or ""
+            if text:
+                chunks.append(text)
     return "\n".join(chunks)
 
 def clean_number(s: str) -> float:
@@ -131,7 +155,7 @@ def pick_value_for_terminal(pdf_text: str):
     value = round(clean_number(raw_third), 2)
     return effective, value
 
-# ========= Siuntimas į Apps Script =========
+# ========= SIUNTIMAS Į APPS SCRIPT =========
 def post_to_webapp(date_str: str, price: float):
     payload = {"date": date_str, "price": price}
     r = SESSION.post(WEBHOOK_URL, json=payload, timeout=30)
@@ -142,12 +166,12 @@ def post_to_webapp(date_str: str, price: float):
 def main():
     try:
         candidates = collect_candidate_pdfs()
-        print(f"[INFO] Rasta PDF nuorodų: {len(candidates)}")
+        print(f"[INFO] Kandidatų (PDF) rasta: {len(candidates)}")
         last_err = None
 
-        for idx, pdf_url in enumerate(candidates, start=1):
+        for i, pdf_url in enumerate(candidates, 1):
             try:
-                print(f"[INFO] ({idx}/{len(candidates)}) Bandau: {pdf_url}")
+                print(f"[INFO] ({i}/{len(candidates)}) Bandau: {pdf_url}")
                 pdf_bytes = http_get(pdf_url).content
                 text = extract_pdf_text(pdf_bytes)
                 date_str, price = pick_value_for_terminal(text)
@@ -161,7 +185,6 @@ def main():
                 last_err = e
                 print(f"[WARN] Netinka ({type(e).__name__}): {e}")
 
-        # jei nė vieno nepavyko apdoroti
         raise RuntimeError(f"Nepavyko rasti tinkamo PDF. Paskutinė klaida: {last_err}")
 
     except Exception as e:
