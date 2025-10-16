@@ -56,4 +56,30 @@ def pick_value_for_terminal(pdf_text: str):
         above = [i for i in prod_idxs if i < t]
         tgt_idx = above[-1] if above else prod_idxs[-1]
     else:
-        tgt_idx = prod_idxs[-]()
+        tgt_idx = prod_idxs[-1]
+    row = lines[tgt_idx]
+    nums = re.findall(r"[0-9][0-9\s.,]*", row)
+    if len(nums) < 3:
+        raise RuntimeError("Eilutėje per mažai skaitinių stulpelių.")
+    raw_third = nums[2]
+    value = round(clean_number(raw_third), 2)
+    return effective, value
+
+def post_to_webapp(date_str: str, price: float):
+    payload = {"date": date_str, "price": price}
+    r = requests.post(WEBHOOK_URL, json=payload, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def main():
+    pdf_url = find_latest_pdf_url()
+    pdf_bytes = http_get(pdf_url).content
+    text = extract_pdf_text(pdf_bytes)
+    date_str, price = pick_value_for_terminal(text)
+    if not date_str:
+        date_str = "1970-01-01 00:00"
+    resp = post_to_webapp(date_str, price)
+    print("Sent:", {"date": date_str, "price": price}, "Resp:", resp)
+
+if __name__ == "__main__":
+    main()
