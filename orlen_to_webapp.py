@@ -6,10 +6,10 @@ import pdfplumber
 from urllib.parse import urljoin
 from datetime import datetime
 
-# ======= NUSTATYMAI =======
+# ========= NUSTATYMAI =========
 WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbzkz6TJAGXtUDotTsXxYnPCmtBXNdI73Yq7g61TapYTAWIgujqgJ_S2XajI9FHMK_Y9rg/exec"
 
-# Puslapiai, kuriuose ieškosim PDF nuorodų
+# Puslapiai, kuriuose ieškom PDF
 LIST_URLS = [
     "https://www.orlenlietuva.lt/LT/Wholesale/Puslapiai/Kainu-protokolai.aspx",
     "https://www.orlenlietuva.lt/lt/wholesale/_layouts/f2hPriceTable/default.aspx",
@@ -19,10 +19,10 @@ LIST_URLS = [
 PRODUCT_PREFIX = "Automobilinis 95 markės benzinas E10"
 TERMINAL_LINE = 'Akcinės bendrovės "Orlen Lietuva" terminalas Juodeikių km, Mažeikių raj.'
 
-# Antraštės data PDF viduje, pvz.: "Kainos galioja nuo 2025-10-15 09:00"
+# Antraštės data PDF viduje: "Kainos galioja nuo 2025-10-15 09:00"
 DATE_RE = re.compile(r"Kainos galioja nuo\s+(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})")
 
-# ======= HTTP =======
+# ========= HTTP =========
 SESSION = requests.Session()
 SESSION.headers.update({
     "User-Agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -35,76 +35,42 @@ def http_get(url, **kw):
     r.raise_for_status()
     return r
 
-# ======= PDF NUORODOS PAIEŠKA =======
-
+# ========= PDF NUORODOS =========
 def get_all_pdf_links(html: str, base_url: str):
-    """Grąžina absoliučius PDF URL iš HTML teksto."""
-    # href="...pdf" ir '...pdf'
+    """Suranda visas .pdf nuorodas ir paverčia į absoliučius URL."""
     links = re.findall(r'href=["\']([^"\']+\.pdf)["\']', html, flags=re.I)
-    # dar vienas „plačios“ paieškos variantas
     links += re.findall(r'(https?://[^\s"\']+\.pdf)', html, flags=re.I)
-    # normalizuojam į absoliučius
-    abs_links = []
+    abs_links, seen = [], set()
     for link in links:
-        abs_links.append(urljoin(base_url, link))
-    # pašalinam dublikatus išlaikant eiliškumą
-    seen = set()
-    out = []
-    for u in abs_links:
+        u = urljoin(base_url, link)
         if u not in seen:
-            out.append(u)
+            abs_links.append(u)
             seen.add(u)
-    return out
+    return abs_links
 
 def parse_date_from_url(url: str):
-    """
-    Bando išsitraukti datą iš failo URL/pavadinimo, pvz. 2025-10-15 ar 2025_10_15 ar 20251015.
-    Grąžina datetime arba None.
-    """
-    patterns = [
-        r"(\d{4})[-_](\d{2})[-_](\d{2})",
-        r"(\d{4})(\d{2})(\d{2})"
-    ]
-    for pat in patterns:
+    """Iš URL bando ištraukti YYYY-MM-DD, YYYY_MM_DD arba YYYYMMDD."""
+    pats = [r"(\d{4})[-_](\d{2})[-_](\d{2})", r"(\d{4})(\d{2})(\d{2})"]
+    for pat in pats:
         m = re.search(pat, url)
         if m:
             try:
-                y, mth, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
-                return datetime(y, mth, d)
+                return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
             except Exception:
                 pass
     return None
 
 def choose_latest_link(links):
-    """
-    Jei bent ant kai kurių nuorodų yra data – rūšiuojam pagal ją (naujausia pirmoji).
-    Jei ne – grąžinam pirmą rastą.
-    Taip pat trumpai patikrinam, kad URL atsako 200 (HEAD/GET).
-    """
+    """Rikiuoja pagal datą URL’e; jei nėra – ima pirmą gyvą (status 200/3xx)."""
     if not links:
         return None
-
-    with_dates = []
-    without_dates = []
+    with_dates, without = [], []
     for u in links:
         d = parse_date_from_url(u)
-        if d:
-            with_dates.append((d, u))
-        else:
-            without_dates.append(u)
-
-    # prioritetas – su data
-    ordered = []
-    if with_dates:
-        with_dates.sort(key=lambda x: x[0], reverse=True)
-        ordered = [u for _, u in with_dates] + without_dates
-    else:
-        ordered = links
-
-    # grąžinam pirmą egzistuojantį (status 200)
+        (with_dates if d else without).append((d, u) if d else u)
+    ordered = [u for d, u in sorted(with_dates, key=lambda x: x[0], reverse=True)] + without if with_dates else links
     for u in ordered:
         try:
-            # kartais HEAD blokuojamas – tada pabandysim GET su stream
             h = SESSION.head(u, timeout=15, allow_redirects=True)
             if 200 <= h.status_code < 400:
                 return u
@@ -117,7 +83,6 @@ def choose_latest_link(links):
                 return u
         except Exception:
             pass
-    # jei niekas neatsako – grąžinam pirmą
     return ordered[0]
 
 def find_latest_pdf_url():
@@ -130,8 +95,7 @@ def find_latest_pdf_url():
                 return chosen
     raise RuntimeError("Neradau PDF nuorodos.")
 
-# ======= PDF NUSKAITYMAS =======
-
+# ========= PDF NUSKAITYMAS =========
 def extract_pdf_text(pdf_bytes: bytes):
     chunks = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
@@ -148,14 +112,11 @@ def clean_number(s: str) -> float:
 
 def pick_value_for_terminal(pdf_text: str):
     """
-    Grąžina (date_str 'YYYY-MM-DD HH:MM' arba None, price float)
-    – paima 3-čią skaičių produkto eilutėje: 'Bazinė kaina su akcizo mokesčiu'.
+    Grąžina (date_str 'YYYY-MM-DD HH:MM' arba None, price float).
+    Ima 3-ią skaičių produkto eilutėje = 'Bazinė kaina su akcizo mokesčiu'.
     """
-    # data iš antraštės
     mdate = DATE_RE.search(pdf_text)
-    effective = None
-    if mdate:
-        effective = f"{mdate.group(1)} {mdate.group(2)}"
+    effective = f"{mdate.group(1)} {mdate.group(2)}" if mdate else None
 
     lines = pdf_text.splitlines()
     prod_idxs = [i for i, l in enumerate(lines) if l.strip().startswith(PRODUCT_PREFIX)]
@@ -178,34 +139,50 @@ def pick_value_for_terminal(pdf_text: str):
     value = round(clean_number(raw_third), 2)
     return effective, value
 
-# ======= SIUNTIMAS Į APPS SCRIPT =======
-
+# ========= SIUNTIMAS Į APPS SCRIPT =========
 def post_to_webapp(date_str: str, price: float):
     payload = {"date": date_str, "price": price}
     r = SESSION.post(WEBHOOK_URL, json=payload, timeout=30)
     r.raise_for_status()
     return r.json()
 
-# ======= MAIN =======
-
+# ========= MAIN =========
 def main():
-    pdf_url = find_latest_pdf_url()
-    print(f"[INFO] Pasirinktas PDF: {pdf_url}")
-    pdf_bytes = http_get(pdf_url).content
-
-    text = extract_pdf_text(pdf_bytes)
-    date_str, price = pick_value_for_terminal(text)
-    if not date_str:
-        # jei neradom datos PDF viršuje – vis tiek siųsim (Apps Script nukirps iki YYYY-MM-DD)
-        date_str = "1970-01-01 00:00"
-
-    print(f"[INFO] Ištraukti duomenys: date={date_str}, price={price}")
-    resp = post_to_webapp(date_str, price)
-    print("[INFO] WebApp atsakymas:", resp)
-
-if __name__ == "__main__":
     try:
-        main()
+        # 1) pabandom „naujausią“
+        pdf_url = find_latest_pdf_url()
+        print(f"[INFO] Pasirinktas PDF: {pdf_url}")
+        pdf_bytes = http_get(pdf_url).content
+        text = extract_pdf_text(pdf_bytes)
+
+        # 2) bandome ištraukti – jei lentelė ne ta, bandom „protokol*“ alternatyvą
+        try:
+            date_str, price = pick_value_for_terminal(text)
+        except RuntimeError as e:
+            print(f"[WARN] {e} — bandau kitą PDF, jei yra...")
+            all_links = []
+            for url in LIST_URLS:
+                html = http_get(url).text
+                all_links.extend(get_all_pdf_links(html, url))
+            fallback = [u for u in all_links if "protokol" in u.lower()]
+            if not fallback:
+                raise
+            pdf_url = choose_latest_link(fallback)
+            print(f"[INFO] Bandau alternatyvų PDF: {pdf_url}")
+            pdf_bytes = http_get(pdf_url).content
+            text = extract_pdf_text(pdf_bytes)
+            date_str, price = pick_value_for_terminal(text)
+
+        if not date_str:
+            date_str = "1970-01-01 00:00"
+
+        print(f"[INFO] Ištraukti duomenys: date={date_str}, price={price}")
+        resp = post_to_webapp(date_str, price)
+        print("[INFO] WebApp atsakymas:", resp)
+
     except Exception as e:
         print("[ERROR]", e, file=sys.stderr)
         sys.exit(1)
+
+if __name__ == "__main__":
+    main()
