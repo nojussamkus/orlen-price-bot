@@ -1,127 +1,115 @@
 import re
 import io
 import sys
+from datetime import datetime
+from urllib.parse import urljoin
+
 import requests
 import pdfplumber
-from urllib.parse import urljoin
-from datetime import datetime
+from bs4 import BeautifulSoup
 
-# ========= NUSTATYMAI =========
+# ======= NUSTATYMAI =======
 WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbzkz6TJAGXtUDotTsXxYnPCmtBXNdI73Yq7g61TapYTAWIgujqgJ_S2XajI9FHMK_Y9rg/exec"
 
-LIST_URLS = [
-    "https://www.orlenlietuva.lt/LT/Wholesale/Puslapiai/Kainu-protokolai.aspx",
-    "https://www.orlenlietuva.lt/lt/wholesale/_layouts/f2hPriceTable/default.aspx",
-]
+# Puslapis su lentele "Kainų protokolai"
+PROTO_PAGE = "https://www.orlenlietuva.lt/LT/Wholesale/Puslapiai/Kainu-protokolai.aspx"
 
+# Produkto/terminalo inkarai
 PRODUCT_PREFIX = "Automobilinis 95 markės benzinas E10"
 TERMINAL_LINE = 'Akcinės bendrovės "Orlen Lietuva" terminalas Juodeikių km, Mažeikių raj.'
 DATE_RE = re.compile(r"Kainos galioja nuo\s+(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})")
 
-# FILTRAI
-EXCLUDE_KEYWORDS = ("realizacij", "internet")   # atmesti „realizacija internet“ PDF
-PREFER_KEYWORDS  = ("protokol", "protokolas", "protokolai", "kainų protokol")  # pirmenybė protokolams
-
+# HTTP session
 SESSION = requests.Session()
 SESSION.headers.update({
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/123.0 Safari/537.36"
 })
+
+
+# ======= Pagalbinės =======
 
 def http_get(url, **kw):
     r = SESSION.get(url, timeout=30, **kw)
     r.raise_for_status()
     return r
 
-# ========= NAUDINGOS PAGALBINĖS =========
-A_TAG_RE = re.compile(r'<a\s+[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', re.I | re.S)
-
-def extract_links_with_text(html: str, base_url: str):
-    """Grąžina [(abs_url, visible_text)] iš visų <a>…</a>."""
-    out = []
-    for href, text in A_TAG_RE.findall(html):
-        url = urljoin(base_url, href.strip())
-        vis = re.sub(r"<[^>]+>", " ", text)
-        vis = re.sub(r"\s+", " ", vis).strip()
-        out.append((url, vis))
-    return out
-
-def parse_date_from_string(s: str):
-    """Iš URL arba teksto ištraukia datą (YYYY-MM-DD | YYYY_MM_DD | YYYYMMDD)."""
-    for pat in (r"(\d{4})[-_](\d{2})[-_](\d{2})", r"(\d{4})(\d{2})(\d{2})"):
-        m = re.search(pat, s)
-        if m:
-            try:
-                return datetime(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-            except Exception:
-                pass
-    return None
-
-def is_pdf_like(url: str, text: str):
-    u = url.lower()
-    t = text.lower()
-    if any(k in u or k in t for k in EXCLUDE_KEYWORDS):
-        return False
-    # bent kažkoks PDF/Protokolo indikatorius
-    return u.endswith(".pdf") or "pdf" in u or "pdf" in t or any(k in u or k in t for k in PREFER_KEYWORDS)
-
-def collect_candidate_pdfs():
-    """Surenka kandidatų sąrašą ir surikiuoja: (protokol prioritetas, data desc)."""
-    pairs = []
-    for page in LIST_URLS:
-        html = http_get(page).text
-        pairs += extract_links_with_text(html, page)
-
-    # unikalizuojam
-    seen = set()
-    pairs = [(u, t) for (u, t) in pairs if (u, t) not in seen and not seen.add((u, t))]
-
-    # filtravimas
-    filtered = [(u, t) for (u, t) in pairs if is_pdf_like(u, t)]
-    if not filtered:
-        raise RuntimeError("Neradau PDF kandidatų (po filtravimo).")
-
-    def score(item):
-        u, t = item
-        txt = (u + " " + t).lower()
-        prefer = 1 if any(k in txt for k in PREFER_KEYWORDS) else 0
-        d = parse_date_from_string(u) or parse_date_from_string(t) or datetime.min
-        return (prefer, d)
-
-    filtered.sort(key=score, reverse=True)
-    return filtered  # grąžinam (url, text)
-
-# ========= PDF PARSINIMAS =========
-def extract_pdf_text_from_bytes(pdf_bytes: bytes):
-    """Grąžina ištisinį tekstą arba pakelia klaidą, jei PDF neskaitytinas."""
-    # pirmas patikrinimas – PDF „magija“
-    if len(pdf_bytes) < 10:
-        raise RuntimeError("Atsisiųstas failas per mažas.")
-    try:
-        # ne visi PDF prasideda %PDF pirmuose 4 baituose dėl BOM/WS, bet tikrinam euristiškai
-        if not pdf_bytes[:4] == b"%PDF":
-            # vis tiek bandome atidaryti su pdfplumber
-            pass
-        chunks = []
-        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-            for p in pdf.pages:
-                t = p.extract_text() or ""
-                if t:
-                    chunks.append(t)
-        txt = "\n".join(chunks).strip()
-        if not txt:
-            raise RuntimeError("PDF teksto nerasta (tuščias).")
-        return txt
-    except Exception as e:
-        raise RuntimeError(f"PDF skaitymo klaida: {e}")
-
 def clean_number(s: str) -> float:
     s = s.replace("\xa0", " ").replace(" ", "")
     s = s.replace(",", ".")
     return float(s)
 
+
+# ======= 1) Rasti naujausio protokolo PDF iš lentelės =======
+
+def find_latest_protocol_pdf_url():
+    """
+    Parsina PROTO_PAGE lentelę "Kainų protokolai":
+    - ima pirmą eilutę (naujausią datą),
+    - paima dešinės skilties nuorodą "Parsisiųsti",
+    - grąžina absoliutų PDF URL.
+    Jei dėl kokios nors priežasties nepavyksta, bando rasti pirma .pdf nuorodą puslapyje.
+    """
+    html = http_get(PROTO_PAGE).text
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Surandam lentelę su stulpeliais "Data" ir "Kainų protokolai"
+    table = None
+    for tbl in soup.find_all("table"):
+        head_txt = " ".join((tbl.thead.get_text(" ", strip=True) if tbl.thead else tbl.get_text(" ", strip=True))).lower()
+        if "data" in head_txt and "kainų protokolai" in head_txt:
+            table = tbl
+            break
+    if not table:
+        # fallback – imti pirmą "Parsisiųsti" nuorodą puslapyje
+        a = soup.find("a", string=lambda s: s and "Parsisi" in s)
+        if a and a.get("href"):
+            return urljoin(PROTO_PAGE, a["href"])
+        # dar vienas fallback – pirma .pdf nuoroda
+        a = soup.find("a", href=lambda h: h and h.lower().endswith(".pdf"))
+        if a:
+            return urljoin(PROTO_PAGE, a["href"])
+        raise RuntimeError("Neradau protokolų lentelės ar PDF nuorodos.")
+
+    # Imame pirmą (viršutinę) eilutę <tr> su data ir "Parsisiųsti"
+    first_row = None
+    for tr in table.find_all("tr"):
+        tds = tr.find_all(["td", "th"])
+        if len(tds) >= 2 and "Parsisi" in tds[-1].get_text():
+            first_row = tr
+            break
+    if not first_row:
+        raise RuntimeError("Neradau pirmos protokolo eilutės su 'Parsisiųsti'.")
+
+    link = first_row.find("a", href=True)
+    if not link:
+        raise RuntimeError("Neradau PDF nuorodos 'Parsisiųsti' langelyje.")
+    return urljoin(PROTO_PAGE, link["href"])
+
+
+# ======= 2) Ištraukti tekstą iš PDF =======
+
+def extract_pdf_text(pdf_bytes: bytes) -> str:
+    chunks = []
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        for p in pdf.pages:
+            t = p.extract_text() or ""
+            if t:
+                chunks.append(t)
+    txt = "\n".join(chunks).strip()
+    if not txt:
+        raise RuntimeError("PDF teksto nerasta (tuščias).")
+    return txt
+
+
+# ======= 3) Rasti datą ir kainą PDF’e =======
+
 def pick_value_for_terminal(pdf_text: str):
-    """Grąžina (date_str 'YYYY-MM-DD HH:MM' arba None, price float)."""
+    """
+    Grąžina (date_str 'YYYY-MM-DD HH:MM' arba None, price float).
+    Eina per teksto eilutes, randa produkto eilutę ir paima 3-ią skaičių –
+    'Bazinė kaina su akcizo mokesčiu'.
+    """
     mdate = DATE_RE.search(pdf_text)
     effective = f"{mdate.group(1)} {mdate.group(2)}" if mdate else None
 
@@ -129,8 +117,9 @@ def pick_value_for_terminal(pdf_text: str):
     prod_idxs = [i for i, l in enumerate(lines) if l.strip().startswith(PRODUCT_PREFIX)]
     if not prod_idxs:
         raise RuntimeError("Neradau produkto eilutės: " + PRODUCT_PREFIX)
-    term_idxs = [i for i, l in enumerate(lines) if TERMINAL_LINE in l]
 
+    # rasti artimiausią produkto eilutę virš terminalo aprašymo (jei toks yra)
+    term_idxs = [i for i, l in enumerate(lines) if TERMINAL_LINE in l]
     if term_idxs:
         t = term_idxs[0]
         above = [i for i in prod_idxs if i < t]
@@ -142,46 +131,41 @@ def pick_value_for_terminal(pdf_text: str):
     nums = re.findall(r"[0-9][0-9\s.,]*", row)
     if len(nums) < 3:
         raise RuntimeError("Eilutėje per mažai skaitinių stulpelių.")
-    raw_third = nums[2]
-    value = round(clean_number(raw_third), 2)
+    value = round(clean_number(nums[2]), 2)
     return effective, value
 
-# ========= SIUNTIMAS Į APPS SCRIPT =========
+
+# ======= 4) Siųsti į Google Apps Script =======
+
 def post_to_webapp(date_str: str, price: float):
     payload = {"date": date_str, "price": price}
     r = SESSION.post(WEBHOOK_URL, json=payload, timeout=30)
     r.raise_for_status()
     return r.json()
 
-# ========= MAIN =========
+
+# ======= MAIN =======
+
 def main():
     try:
-        candidates = collect_candidate_pdfs()
-        print(f"[INFO] Kandidatų (po filtravimo/rikiavimo): {len(candidates)}")
-        last_err = None
+        pdf_url = find_latest_protocol_pdf_url()
+        print(f"[INFO] Naujausio protokolo PDF: {pdf_url}")
+        pdf_bytes = http_get(pdf_url).content
 
-        for i, (url, text) in enumerate(candidates, 1):
-            try:
-                print(f"[INFO] ({i}/{len(candidates)}) Bandau: {url}   [{text}]")
-                resp = http_get(url)
-                pdf_bytes = resp.content
-                pdf_text = extract_pdf_text_from_bytes(pdf_bytes)
-                date_str, price = pick_value_for_terminal(pdf_text)
-                if not date_str:
-                    date_str = "1970-01-01 00:00"
-                print(f"[INFO] TINKA: date={date_str}, price={price}")
-                web_resp = post_to_webapp(date_str, price)
-                print("[INFO] WebApp atsakymas:", web_resp)
-                return
-            except Exception as e:
-                last_err = e
-                print(f"[WARN] Netinka ({type(e).__name__}): {e}")
+        text = extract_pdf_text(pdf_bytes)
+        date_str, price = pick_value_for_terminal(text)
+        if not date_str:
+            # jei dėl kokių nors priežasčių nepavyko paimti datos – vis tiek siųsti
+            date_str = "1970-01-01 00:00"
 
-        raise RuntimeError(f"Nepavyko rasti tinkamo PDF. Paskutinė klaida: {last_err}")
+        print(f"[INFO] Ištraukti duomenys: date={date_str}, price={price}")
+        resp = post_to_webapp(date_str, price)
+        print("[INFO] WebApp atsakymas:", resp)
 
     except Exception as e:
         print("[ERROR]", e, file=sys.stderr)
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
