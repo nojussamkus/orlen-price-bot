@@ -18,6 +18,10 @@ PRODUCT_PREFIX = "Automobilinis 95 markės benzinas E10"
 TERMINAL_LINE = 'Akcinės bendrovės "Orlen Lietuva" terminalas Juodeikių km, Mažeikių raj.'
 DATE_RE = re.compile(r"Kainos galioja nuo\s+(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})")
 
+# FILTRAI
+EXCLUDE_KEYWORDS = ("realizacij", "internet")   # atmesti visus „realizacija internet“ PDF
+PREFER_KEYWORDS  = ("protokol", "protokolas")   # prioritetas protokolams
+
 SESSION = requests.Session()
 SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
@@ -37,14 +41,13 @@ def extract_links_with_text(html: str, base_url: str):
     out = []
     for href, text in A_TAG_RE.findall(html):
         url = urljoin(base_url, href.strip())
-        # sutvarkom tekstą
         vis = re.sub(r"<[^>]+>", " ", text)
         vis = re.sub(r"\s+", " ", vis).strip()
         out.append((url, vis))
     return out
 
 def parse_date_from_string(s: str):
-    """Bando išsitraukti datą iš URL arba teksto: YYYY-MM-DD | YYYY_MM_DD | YYYYMMDD."""
+    """Iš URL arba teksto ištraukia datą, jei yra: YYYY-MM-DD | YYYY_MM_DD | YYYYMMDD."""
     for pat in (r"(\d{4})[-_](\d{2})[-_](\d{2})", r"(\d{4})(\d{2})(\d{2})"):
         m = re.search(pat, s)
         if m:
@@ -54,9 +57,14 @@ def parse_date_from_string(s: str):
                 pass
     return None
 
-def is_pdf_url(url: str):
-    """Greita euristika – bet tikriname ir atsakymo Content-Type vėliau."""
-    return url.lower().endswith(".pdf") or "pdf" in url.lower()
+def is_pdf_like(url: str, text: str):
+    u = url.lower()
+    t = text.lower()
+    # atmesti nepageidaujamus
+    if any(k in u or k in t for k in EXCLUDE_KEYWORDS):
+        return False
+    # bent kažkoks PDF indikatorius (arba tekste, arba URL)
+    return u.endswith(".pdf") or "pdf" in u or "pdf" in t or any(k in u or k in t for k in PREFER_KEYWORDS)
 
 def head_or_get(url: str):
     """Grąžina (ok_bool, content_type_str)."""
@@ -77,40 +85,35 @@ def head_or_get(url: str):
         return False, ""
 
 def collect_candidate_pdfs():
-    """Surenkam VISAS kandidatų nuorodas su tekstais, dedam prioritetą 'protokol*', tikrinam Content-Type."""
+    """Surenkam visas PDF nuorodas su tekstais, atmetame „realizacija internet“, teikiam pirmenybę „protokol*“."""
     pairs = []
     for page in LIST_URLS:
         html = http_get(page).text
         pairs += extract_links_with_text(html, page)
 
-    # pašalinam dublikatus išlaikant eiliškumą
+    # unikalizuojam
     seen = set()
-    uniq_pairs = []
-    for u, t in pairs:
-        if (u, t) not in seen:
-            seen.add((u, t))
-            uniq_pairs.append((u, t))
+    pairs = [(u, t) for (u, t) in pairs if (u, t) not in seen and not seen.add((u, t))]
 
-    # filtruojame tik tas, kurios atrodo kaip PDF arba galėtų grąžinti PDF
-    maybe_pdf = [(u, t) for (u, t) in uniq_pairs if is_pdf_url(u) or "protokol" in t.lower() or "pdf" in t.lower()]
+    # filtruojam
+    filtered = [(u, t) for (u, t) in pairs if is_pdf_like(u, t)]
 
-    # patikriname HEAD/GET ir pasiliekame tik tas, kurių Content-Type rodo pdf
+    # patikrinam kad tikrai PDF
     validated = []
-    for u, t in maybe_pdf:
+    for u, t in filtered:
         ok, ct = head_or_get(u)
         if ok and "pdf" in ct.lower():
             validated.append((u, t))
-
     if not validated:
-        raise RuntimeError("Neradau PDF kandidatų su PDF turiniu.")
+        raise RuntimeError("Neradau PDF kandidatų su PDF turiniu (po filtravimo).")
 
-    # scoring: 1) ar tekste yra 'protokol'/'protokolas', 2) data (desc)
+    # scoring: 1) ar 'protokol*' nuorodos tekste/URL, 2) data (desc)
     def score(item):
         u, t = item
-        prot = 1 if ("protokol" in t.lower()) else 0
+        txt = (u + " " + t).lower()
+        prefer = 1 if any(k in txt for k in PREFER_KEYWORDS) else 0
         d = parse_date_from_string(u) or parse_date_from_string(t) or datetime.min
-        # didesnis geriau: (prot, data)
-        return (prot, d)
+        return (prefer, d)
 
     validated.sort(key=score, reverse=True)
     return [u for (u, _) in validated]
@@ -166,7 +169,7 @@ def post_to_webapp(date_str: str, price: float):
 def main():
     try:
         candidates = collect_candidate_pdfs()
-        print(f"[INFO] Kandidatų (PDF) rasta: {len(candidates)}")
+        print(f"[INFO] Kandidatų (PDF) po filtravimo: {len(candidates)}")
         last_err = None
 
         for i, pdf_url in enumerate(candidates, 1):
