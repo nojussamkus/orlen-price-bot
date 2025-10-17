@@ -8,7 +8,7 @@ import requests
 import pdfplumber
 from bs4 import BeautifulSoup
 
-# ========== KONFIGAS ==========
+# ================== KONFIGAS ==================
 WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbzkz6TJAGXtUDotTsXxYnPCmtBXNdI73Yq7g61TapYTAWIgujqgJ_S2XajI9FHMK_Y9rg/exec"
 
 PAGES = [
@@ -16,8 +16,11 @@ PAGES = [
     "https://www.orlenlietuva.lt/LT/Wholesale/Puslapiai/Kainu-protokolai.aspx",
 ]
 
+# Tikslinis skyrius + eilutė
+TERMINAL_HDR  = 'Akcinės bendrovės "Orlen Lietuva" terminalas Juodeikių km, Mažeikių raj.'
 PRODUCT_PREFIX = "Automobilinis 95 markės benzinas E10"
-TERMINAL_LINE  = 'Akcinės bendrovės "Orlen Lietuva" terminalas Juodeikių km, Mažeikių raj.'
+
+# Data PDF’e
 DATE_RE = re.compile(r"Kainos galioja nuo\s+(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})")
 
 SESSION = requests.Session()
@@ -26,7 +29,7 @@ SESSION.headers.update({
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 })
 
-# ========== HELPERS ==========
+# ================== HELPERS ==================
 def http_get(url):
     r = SESSION.get(url, timeout=30)
     r.raise_for_status()
@@ -47,8 +50,8 @@ def parse_date_from_str(s: str) -> datetime:
                 pass
     return datetime.min
 
-# ========== 1) Surenkam PDF nuorodas ==========
-PDF_RE = re.compile(r"(https?://[^\s\"']+\.pdf(?:\?[^\s\"']*)?)", re.I)
+# ================== PDF NUORODOS ==================
+PDF_RE  = re.compile(r"(https?://[^\s\"']+\.pdf(?:\?[^\s\"']*)?)", re.I)
 HREF_RE = re.compile(r"\.pdf($|\?)", re.I)
 
 def collect_pdf_links():
@@ -77,19 +80,21 @@ def choose_latest_pdf(links):
     print(f"[INFO] Rasta PDF nuorodų: {len(links)}. Naujausias: {latest}")
     return latest
 
-# ========== 2) Lentelės skaitymas (pirmas bandymas) ==========
-def try_pick_from_table(pdf_bytes: bytes):
+# ================== LENTELĖS REŽIMAS ==================
+def try_pick_from_table_strict(pdf_bytes: bytes):
     """
-    Bando ištraukti 3-ią skaitinį stulpelį (Bazinė kaina su akcizu) iš lentelės.
-    Grąžina (date_str, price) arba pakelia klaidą, jei nepavyko.
+    Skaito pdfplumber lenteles, bet ima TIK tą bloką, kuris yra po
+    TERMINAL_HDR antrašte ir iki kitos antraštės. Iš ten parenka
+    eilutę, prasidedančią PRODUCT_PREFIX, ir grąžina 3-čią skaitinį stulpelį.
     """
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        # data iš bet kurio puslapio teksto
+        # data
         full_text = "\n".join((p.extract_text() or "") for p in pdf.pages)
         mdate = DATE_RE.search(full_text)
         date_str = f"{mdate.group(1)} {mdate.group(2)}" if mdate else None
 
-        # einam per puslapius, kol randam lentelę su mūsų eilute
+        in_target_block = False
+
         for p in pdf.pages:
             tables = p.extract_tables(
                 table_settings={
@@ -101,31 +106,47 @@ def try_pick_from_table(pdf_bytes: bytes):
                     "edge_min_length": 20,
                 }
             )
+
+            # jei lentelės nesiseka, pereisim prie teksto režimo (bus fallback)
             for tbl in tables or []:
                 for row in tbl:
                     if not row:
                         continue
-                    first = (row[0] or "").strip()
-                    if first.startswith(PRODUCT_PREFIX):
-                        # rinkti skaičius iš likusių stulpelių
-                        nums = []
-                        for cell in row[1:]:
-                            if cell is None:
-                                continue
-                            # kai kuriuose pdf skaičiai būna su tarpais tūkstančiams
-                            m = re.findall(r"[0-9][0-9\s.,]*", str(cell))
-                            for piece in m:
-                                try:
-                                    nums.append(clean_number(piece))
-                                except Exception:
-                                    pass
-                        # pagal stulpelius: [pardavimo, akcizas, bazė su akcizu, PVM, su PVM]
-                        if len(nums) >= 3:
-                            price = round(nums[2], 2)
-                            return date_str, price
-        raise RuntimeError("Lentelės režimu nepavyko rasti eilutės/stulpelio.")
+                    row_txt = " ".join([c for c in row if c]).strip()
 
-# ========== 3) Teksto režimas (atsarginis) ==========
+                    # įeinam į reikiamą bloką
+                    if TERMINAL_HDR in row_txt:
+                        in_target_block = True
+                        continue
+                    # išeinam, kai prasideda kitas blokas (paprastai prasideda nuo UAB/AB ir pan.)
+                    if in_target_block and (row_txt.startswith("UAB ") or row_txt.startswith("AB ") or " terminalas " in row_txt and TERMINAL_HDR not in row_txt):
+                        in_target_block = False
+
+                    if not in_target_block:
+                        continue
+
+                    first_cell = (row[0] or "").strip()
+                    if not first_cell.startswith(PRODUCT_PREFIX):
+                        continue
+
+                    # surenkam skaičius iš likusių stulpelių
+                    nums = []
+                    for cell in row[1:]:
+                        if cell is None:
+                            continue
+                        for piece in re.findall(r"[0-9][0-9\s.,]*", str(cell)):
+                            try:
+                                nums.append(clean_number(piece))
+                            except Exception:
+                                pass
+
+                    # tikimasi: pardavimo, akcizas, bazė su akcizu, PVM, su PVM
+                    if len(nums) >= 3:
+                        return date_str, round(nums[2], 2)
+
+        raise RuntimeError("Lentelių režimu neradau reikiamos eilutės bloko.")
+
+# ================== TEKSTO REŽIMAS (tik skyriuje) ==================
 def extract_pdf_text(pdf_bytes: bytes):
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         texts = [p.extract_text() or "" for p in pdf.pages]
@@ -135,72 +156,94 @@ def extract_pdf_text(pdf_bytes: bytes):
     return txt
 
 def smart_find_numbers(segment: str):
-    fixed = re.sub(r"(\d\.\d{2})(?=\d)", r"\1 ", segment)  # 556.31519.60 -> 556.31 519.60
+    # įterpiam tarpą po kiekvieno x.yy, jei po jo eina skaitmuo (sujungimų taisymas)
+    fixed = re.sub(r"(\d\.\d{2})(?=\d)", r"\1 ", segment)
     matches = re.findall(r"\d+(?:[.,]\d{1,3})?", fixed)
-    cleaned = []
+    out = []
     for m in matches:
         try:
-            val = clean_number(m)
-            if 0 < val < 10000:
-                cleaned.append(val)
+            v = clean_number(m)
+            if 0 < v < 10000:
+                out.append(v)
         except Exception:
-            continue
-    return cleaned
+            pass
+    return out
 
-def pick_from_text(pdf_text: str):
+def pick_from_text_in_block(pdf_text: str):
+    """
+    Iškanda tik tą teksto bloką, kuris yra po TERMINAL_HDR iki kito skyriaus,
+    ir ten ieško mūsų produkto eilutės.
+    """
+    # data
     mdate = DATE_RE.search(pdf_text)
     date_str = f"{mdate.group(1)} {mdate.group(2)}" if mdate else None
 
     lines = pdf_text.splitlines()
-    prod_idxs = [i for i, l in enumerate(lines) if l.strip().startswith(PRODUCT_PREFIX)]
-    if not prod_idxs:
-        raise RuntimeError("Neradau produkto eilutės (teksto režimas).")
+    # surandam bloko ribas
+    start = None
+    for i, l in enumerate(lines):
+        if TERMINAL_HDR in l:
+            start = i + 1
+            break
+    if start is None:
+        raise RuntimeError("Teksto režime neradau TERMINAL_HDR.")
 
-    term_idxs = [i for i, l in enumerate(lines) if TERMINAL_LINE in l]
-    if term_idxs:
-        t0 = term_idxs[0]
-        above = [i for i in prod_idxs if i < t0]
-        idx = above[-1] if above else prod_idxs[-1]
-    else:
-        idx = prod_idxs[-1]
+    # baigiam ties pirma naujo skyriaus indikacija
+    end = len(lines)
+    for j in range(start, len(lines)):
+        t = lines[j].strip()
+        if (t.startswith("UAB ") or t.startswith("AB ")) and "terminalas" in t:
+            end = j
+            break
 
-    window = " ".join(lines[idx: idx + 4])
+    block = lines[start:end]
+
+    # surandam produkto eilutę
+    idx = None
+    for k, l in enumerate(block):
+        if l.strip().startswith(PRODUCT_PREFIX):
+            idx = k
+            break
+    if idx is None:
+        raise RuntimeError("Bloke neradau produkto eilutės.")
+
+    window = " ".join(block[idx: idx + 4])
     nums = smart_find_numbers(window)
     if len(nums) < 3:
-        raise RuntimeError(f"Per mažai skaičių teksto režimu: {nums}")
-    price = round(nums[2], 2)
-    return date_str, price
+        raise RuntimeError(f"Bloke per mažai skaičių: {nums}")
+    return date_str, round(nums[2], 2)
 
-# ========== 4) POST į Apps Script ==========
+# ================== POST į Sheets ==================
 def post_to_webapp(date_str: str, price: float):
     payload = {"date": date_str, "price": price}
     r = SESSION.post(WEBHOOK_URL, json=payload, timeout=30)
     r.raise_for_status()
     return r.json()
 
-# ========== MAIN ==========
+# ================== MAIN ==================
 def main():
     try:
         links = collect_pdf_links()
         pdf_url = choose_latest_pdf(links)
         pdf_bytes = http_get(pdf_url).content
 
-        # 1) bandome per lentelę
+        # 1) bandome lentelių režimu tiksliniame bloke
         try:
-            date_str, price = try_pick_from_table(pdf_bytes)
-            method = "table"
-        except Exception as e_table:
-            print(f"[WARN] Lentelės skaitymas nepavyko: {e_table} — perjungiu į teksto režimą.")
-            text = extract_pdf_text(pdf_bytes)
-            date_str, price = pick_from_text(text)
-            method = "text"
+            date_str, price = try_pick_from_table_strict(pdf_bytes)
+            method = "table-block"
+        except Exception as e_tbl:
+            print(f"[WARN] Lentelės blokas nepavyko: {e_tbl} — perjungiu į teksto bloką.")
+            txt = extract_pdf_text(pdf_bytes)
+            date_str, price = pick_from_text_in_block(txt)
+            method = "text-block"
 
         if not date_str:
             date_str = "1970-01-01 00:00"
 
-        print(f"[INFO] ({method}) Data={date_str}, Kaina={price}")
+        print(f"[INFO] ({method}) {PRODUCT_PREFIX} @ Juodeikių/ Mažeikių: {price}")
         resp = post_to_webapp(date_str, price)
         print("[INFO] WebApp atsakymas:", resp)
+
     except Exception as e:
         print("[ERROR]", e, file=sys.stderr)
         sys.exit(1)
