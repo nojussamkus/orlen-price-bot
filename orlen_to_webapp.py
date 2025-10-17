@@ -11,21 +11,17 @@ from bs4 import BeautifulSoup
 # ===================== KONFIGAS =====================
 WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbzkz6TJAGXtUDotTsXxYnPCmtBXNdI73Yq7g61TapYTAWIgujqgJ_S2XajI9FHMK_Y9rg/exec"
 
-# Iš čia renkamės PDF nuorodas (pirmas – prioritetinis)
 PAGES = [
     "https://www.orlenlietuva.lt/lt/wholesale/_layouts/f2hPriceTable/default.aspx",
     "https://www.orlenlietuva.lt/LT/Wholesale/Puslapiai/Kainu-protokolai.aspx",
 ]
 
-# Tikslus skyrius ir produkto eilutė
 TERMINAL_HDR   = 'Akcinės bendrovės "Orlen Lietuva" terminalas Juodeikių km, Mažeikių raj.'
 PRODUCT_PREFIX = "Automobilinis 95 markės benzinas E10"
-TARGET_COL_TEXT = "Bazinė kaina su akcizo"  # stulpelio antraštė
+TARGET_COL_TEXT = "Bazinė kaina su akcizo"
 
-# Data PDF'e
 DATE_RE = re.compile(r"Kainos galioja nuo\s+(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})")
 
-# HTTP sesija
 SESSION = requests.Session()
 SESSION.headers.update({
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36",
@@ -33,7 +29,7 @@ SESSION.headers.update({
 })
 
 
-# ===================== PAGALBINĖS =====================
+# ===================== HELPERS =====================
 def http_get(url: str) -> requests.Response:
     r = SESSION.get(url, timeout=30)
     r.raise_for_status()
@@ -68,15 +64,12 @@ def collect_pdf_links():
         html = resp.text
         soup = BeautifulSoup(html, "html.parser")
 
-        # <a href="...pdf">
         for a in soup.find_all("a", href=True):
             if HREF_RE.search(a["href"]):
                 found.append(urljoin(base, a["href"]))
 
-        # fallback: „pliki“ PDF URL'ai tekste
         found += PDF_RE.findall(html)
 
-    # unikalizuojam
     uniq, seen = [], set()
     for u in found:
         if u not in seen:
@@ -93,16 +86,50 @@ def choose_latest_pdf(links):
     return latest
 
 
+# ===================== PINIGINIŲ SKAIČIŲ PARSINIMAS =====================
+def money_numbers(segment: str):
+    """
+    Grąžina TIK skaičius su 2 skaitmenimis po kablelio (xx.xx ar xx,xx),
+    pataiso sujungimus (pvz. '1054.20541.20' -> '1054.20 541.20'),
+    leidžia tūkstančių atskyrimą tarpais ar NBSP.
+    """
+    segment = re.sub(r"(\d[.,]\d{2})(?=\d)", r"\1 ", segment)
+
+    pat = re.compile(
+        r"(?<!\d)"
+        r"(\d{1,3}(?:[ \u00A0]\d{3})*|\d+)"
+        r"[.,]\d{2}"
+        r"(?!\d)",
+    )
+
+    vals = []
+    for m in re.finditer(pat, segment):
+        token = m.group(0).replace("\u00A0", " ").replace(" ", "").replace(",", ".")
+        try:
+            v = float(token)
+            if 0 < v < 10000:
+                vals.append(v)
+        except Exception:
+            pass
+    return vals
+
+def pick_after_excise(nums):
+    """
+    Iš skaičių sekos paima reikšmę po 'akcizo' (~513.00).
+    Jei neranda, grąžina trečią elementą kaip atsarginį variantą.
+    """
+    for i, v in enumerate(nums):
+        if 500 <= v <= 530:  # akcizas ~513.00
+            if i + 1 < len(nums):
+                return round(nums[i + 1], 2)
+    if len(nums) >= 3:
+        return round(nums[2], 2)
+    raise RuntimeError(f"Per mažai skaičių: {nums}")
+
+
 # ===================== LENTELĖS REŽIMAS =====================
 def try_pick_from_table_strict(pdf_bytes: bytes):
-    """
-    Skaito pdfplumber lenteles. Eina tik per bloką po TERMINAL_HDR.
-    Ten bando rasti stulpelio indeksą pagal TARGET_COL_TEXT.
-    Jei neranda – ima 3-čią skaitinį langelį toje eilutėje.
-    Grąžina (date_str, price) arba kelia klaidą.
-    """
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
-        # data
         full_text = "\n".join((p.extract_text() or "") for p in pdf.pages)
         mdate = DATE_RE.search(full_text)
         date_str = f"{mdate.group(1)} {mdate.group(2)}" if mdate else None
@@ -128,21 +155,17 @@ def try_pick_from_table_strict(pdf_bytes: bytes):
                         continue
                     row_txt = " ".join([c for c in row if c]).strip()
 
-                    # įėjimas į bloką
                     if TERMINAL_HDR in row_txt:
                         in_block = True
-                        # bandome pagauti antraščių eilutę tame pačiame ar sekančiame kontekste
                         if TARGET_COL_TEXT.lower() in row_txt.lower():
                             for i, cell in enumerate(row):
                                 if cell and TARGET_COL_TEXT.lower() in str(cell).lower():
                                     target_col_idx = i
                         continue
 
-                    # išėjimas iš bloko – kitas terminalo headingas
                     if in_block and ((row_txt.startswith("UAB ") or row_txt.startswith("AB ")) and "terminalas" in row_txt):
                         in_block = False
 
-                    # antraščių „pagavimas“ jei jos ateina kiek anksčiau ar vėliau
                     if TARGET_COL_TEXT.lower() in row_txt.lower():
                         for i, cell in enumerate(row):
                             if cell and TARGET_COL_TEXT.lower() in str(cell).lower():
@@ -151,35 +174,26 @@ def try_pick_from_table_strict(pdf_bytes: bytes):
                     if not in_block:
                         continue
 
-                    # produkto eilutė
                     first = (row[0] or "").strip()
                     if not first.startswith(PRODUCT_PREFIX):
                         continue
 
-                    # 1) jei žinome stulpelio indeksą – imame būtent jį
+                    # 1) jei žinomas stulpelio indeksas – imame jį
                     if target_col_idx is not None and target_col_idx < len(row):
                         cell = row[target_col_idx]
                         if cell:
-                            nums = re.findall(r"[0-9][0-9\s.,]*", str(cell))
-                            for piece in nums:
-                                try:
-                                    price = round(clean_number(piece), 2)
-                                    return date_str, price
-                                except Exception:
-                                    pass
+                            nums = money_numbers(str(cell))
+                            if nums:
+                                return date_str, pick_after_excise(nums)
 
-                    # 2) atsarginis – 3-ias skaitinis langelis eilutėje po pavadinimo
+                    # 2) atsarginis – iš visos eilutės surenkam piniginius skaičius
                     nums = []
                     for cell in row[1:]:
                         if cell is None:
                             continue
-                        for piece in re.findall(r"[0-9][0-9\s.,]*", str(cell)):
-                            try:
-                                nums.append(clean_number(piece))
-                            except Exception:
-                                pass
-                    if len(nums) >= 3:
-                        return date_str, round(nums[2], 2)
+                        nums.extend(money_numbers(str(cell)))
+                    if nums:
+                        return date_str, pick_after_excise(nums)
 
         raise RuntimeError("Lentelių režimu neradau reikiamos eilutės bloko.")
 
@@ -193,39 +207,7 @@ def extract_pdf_text(pdf_bytes: bytes) -> str:
         raise RuntimeError("PDF tuščias arba ne tekstinis.")
     return txt
 
-def smart_find_numbers(segment: str):
-    """
-    Grąžina TIK „piniginius“ skaičius su 2 skaitmenimis po kablelio (xx.xx ar xx,xx),
-    tvarko sujungimus (pvz. '1054.20541.20' -> '1054.20 541.20'), leidžia tūkstančių grupes.
-    """
-    # įterpiam tarpą tarp dviejų piniginių skaičių, jei jie suklijuoti
-    segment = re.sub(r"(\d[.,]\d{2})(?=\d)", r"\1 ", segment)
-
-    money_pat = re.compile(
-        r"(?<!\d)"                                 # ne prieš kitą skaitmenį
-        r"(\d{1,3}(?:[ \u00A0]\d{3})*|\d+)"        # 1-3 sk. + tūkst. grupės arba vientisas
-        r"[.,]\d{2}"                               # kablelis/taškas + 2 sk.
-        r"(?!\d)",                                 # po to ne skaitmuo
-    )
-
-    vals = []
-    for m in re.finditer(money_pat, segment):
-        token = m.group(0).replace("\u00A0", " ").replace(" ", "").replace(",", ".")
-        try:
-            v = float(token)
-            if 0 < v < 10000:
-                vals.append(v)
-        except Exception:
-            pass
-    return vals
-
 def pick_from_text_in_block(pdf_text: str):
-    """
-    Teksto režimas: imame tik bloką po TERMINAL_HDR iki kito skyriaus.
-    Toje atkarpoje randame produkto eilutę ir iš jos (plius max 2 sek. eilutės)
-    paimame TREČIĄ piniginį skaičių.
-    """
-    # data
     mdate = DATE_RE.search(pdf_text)
     date_str = f"{mdate.group(1)} {mdate.group(2)}" if mdate else None
 
@@ -259,14 +241,12 @@ def pick_from_text_in_block(pdf_text: str):
     if idx is None:
         raise RuntimeError("Bloke neradau produkto eilutės.")
 
-    # tik produkto eilutė + iki 2 sek. eilučių (jei PDF „laužo“ stulpelius)
+    # produkto eilutė + iki 2 sekančių (jei PDF 'laužo' stulpelius)
     window = " ".join(block[idx: idx + 3])
-    nums = smart_find_numbers(window)
-    if len(nums) < 3:
-        raise RuntimeError(f"Per mažai piniginių skaičių produkto eilutėje: {nums}")
-
-    # 3-ias piniginis skaičius – „Bazinė kaina su akcizo mokesčiu“
-    return date_str, round(nums[2], 2)
+    nums = money_numbers(window)
+    if not nums:
+        raise RuntimeError("Neradau piniginių skaičių produkto eilutėje.")
+    return date_str, pick_after_excise(nums)
 
 
 # ===================== SIUNTIMAS Į SHEETS =====================
